@@ -1,15 +1,19 @@
 'use strict';
 
+const uuid = require('uuid');
+const util = require('util');
+const { CronJob } = require('cron');
+
 const logger = require('../../common/logger'),
-    uuid = require('uuid'),
-    CronJob = require('cron').CronJob,
     configHandler = require('../../configManager/models/configHandler'),
-    util = require('util'),
+    testsManager = require('../../tests/models/manager'),
+    reportsManager = require('../../reports/models/reportsManager'),
     dockerHubConnector = require('./dockerHubConnector'),
     databaseConnector = require('./database/databaseConnector'),
     webhooksManager = require('../../webhooks/models/webhookManager'),
     { CONFIG, JOB_TYPE_FUNCTIONAL_TEST } = require('../../common/consts'),
-    generateError = require('../../common/generateError');
+    generateError = require('../../common/generateError'),
+    { version: PREDATOR_VERSION } = require('../../../package.json');
 
 let jobConnector;
 const cronJobs = {};
@@ -52,19 +56,21 @@ module.exports.createJob = async (job) => {
     const configData = await configHandler.getConfig();
     await validateWebhooksAssignment(job.webhooks);
     try {
-        await databaseConnector.insertJob(jobId, job);
+        const insertedJob = await databaseConnector.insertJob(jobId, job);
         logger.info('Job saved successfully to database');
-        const latestDockerImage = await dockerHubConnector.getMostRecentRunnerTag();
-        const runId = Date.now();
-        const jobSpecificPlatformRequest = await createJobRequest(jobId, runId, job, latestDockerImage, configData);
+        const reportId = uuid.v4();
         if (job.run_immediately) {
+            const latestDockerImage = await dockerHubConnector.getMostRecentRunnerTag();
+            const test = await testsManager.getTest(job.test_id);
+            await createReportForJob(reportId, test, insertedJob);
+            const jobSpecificPlatformRequest = await createJobRequest(jobId, reportId, insertedJob, latestDockerImage, configData);
             await jobConnector.runJob(jobSpecificPlatformRequest);
         }
         if (job.cron_expression) {
-            await addCron(jobId, job, job.cron_expression, configData);
+            addCron(jobId, insertedJob, job.cron_expression, configData);
         }
         logger.info('Job deployed successfully');
-        return createResponse(jobId, job, runId);
+        return createResponse(jobId, job, reportId);
     } catch (error) {
         logger.error(error, 'Error occurred trying to create new job');
         return Promise.reject(error);
@@ -79,8 +85,8 @@ module.exports.deleteJob = (jobId) => {
     return databaseConnector.deleteJob(jobId);
 };
 
-module.exports.stopRun = async (jobId, runId) => {
-    await jobConnector.stopRun(util.format(JOB_PLATFORM_NAME, jobId), runId);
+module.exports.stopRun = async (jobId, reportId) => {
+    await jobConnector.stopRun(util.format(JOB_PLATFORM_NAME, reportId));
 };
 
 module.exports.deleteAllContainers = async () => {
@@ -88,11 +94,11 @@ module.exports.deleteAllContainers = async () => {
     return result;
 };
 
-module.exports.getLogs = async function (jobId, runId) {
-    const logs = await jobConnector.getLogs(util.format(JOB_PLATFORM_NAME, jobId), runId, PREDATOR_RUNNER_PREFIX);
+module.exports.getLogs = async function (jobId, reportId) {
+    const logs = await jobConnector.getLogs(util.format(JOB_PLATFORM_NAME, reportId), PREDATOR_RUNNER_PREFIX);
     const response = {
         files: logs,
-        filename: `${jobId}-${runId}.zip`
+        filename: `${jobId}-${reportId}.zip`
     };
 
     return response;
@@ -168,7 +174,7 @@ module.exports.updateJob = async (jobId, jobConfig) => {
     logger.info('Job updated successfully to database');
 };
 
-function createResponse(jobId, jobBody, runId) {
+function createResponse(jobId, jobBody, reportId) {
     const response = {
         id: jobId,
         test_id: jobBody.test_id,
@@ -180,7 +186,7 @@ function createResponse(jobId, jobBody, runId) {
         parallelism: jobBody.parallelism,
         max_virtual_users: jobBody.max_virtual_users,
         custom_env_vars: jobBody.custom_env_vars,
-        run_id: runId,
+        report_id: reportId,
         arrival_rate: jobBody.arrival_rate,
         arrival_count: jobBody.arrival_count,
         duration: jobBody.duration,
@@ -200,20 +206,21 @@ function createResponse(jobId, jobBody, runId) {
     return response;
 }
 
-async function createJobRequest(jobId, runId, jobBody, dockerImage, configData) {
+async function createJobRequest(jobId, reportId, jobBody, dockerImage, configData) {
     const jobTemplate = require(`./${configData.job_platform.toLowerCase()}/jobTemplate`);
-    const jobName = util.format(JOB_PLATFORM_NAME, jobId);
+    const jobPlatformName = util.format(JOB_PLATFORM_NAME, reportId);
     let maxVirtualUsersPerRunner = jobBody.max_virtual_users;
     const parallelism = jobBody.parallelism || 1;
     const environmentVariables = {
         JOB_ID: jobId,
-        RUN_ID: runId.toString(),
         JOB_TYPE: jobBody.type,
         ENVIRONMENT: jobBody.environment,
         TEST_ID: jobBody.test_id,
         PREDATOR_URL: configData.internal_address,
         DELAY_RUNNER_MS: configData.delay_runner_ms.toString(),
-        DURATION: jobBody.duration.toString()
+        DURATION: jobBody.duration.toString(),
+        REPORT_ID: reportId,
+        PREDATOR_VERSION
     };
     if (jobBody.type === JOB_TYPE_FUNCTIONAL_TEST) {
         const arrivalCountPerRunner = Math.ceil(jobBody.arrival_count / parallelism);
@@ -250,13 +257,6 @@ async function createJobRequest(jobId, runId, jobBody, dockerImage, configData) 
     if (jobBody.debug) {
         environmentVariables.DEBUG = jobBody.debug;
     }
-    if (jobBody.emails) {
-        environmentVariables.EMAILS = jobBody.emails.join(';');
-    }
-    if (jobBody.webhooks) {
-        const webhooks = await Promise.all(jobBody.webhooks.map(id => webhooksManager.getWebhook(id)));
-        environmentVariables.WEBHOOKS = webhooks.map(({ url }) => url).join(';');
-    }
 
     if (maxVirtualUsersPerRunner) {
         environmentVariables.MAX_VIRTUAL_USERS = maxVirtualUsersPerRunner.toString();
@@ -271,7 +271,7 @@ async function createJobRequest(jobId, runId, jobBody, dockerImage, configData) 
     }
 
     const customRunnerDefinition = configData.custom_runner_definition;
-    const jobRequest = jobTemplate.createJobRequest(jobName, runId, parallelism, environmentVariables, dockerImage, configData, PREDATOR_RUNNER_PREFIX, customRunnerDefinition);
+    const jobRequest = jobTemplate.createJobRequest(jobPlatformName, reportId, parallelism, environmentVariables, dockerImage, configData, PREDATOR_RUNNER_PREFIX, customRunnerDefinition);
 
     return jobRequest;
 }
@@ -283,8 +283,10 @@ function addCron(jobId, job, cronExpression, configData) {
                 logger.info(`Skipping job with id: ${jobId} as it's currently disabled`);
             } else {
                 const latestDockerImage = await dockerHubConnector.getMostRecentRunnerTag();
-                const runId = Date.now();
-                const jobSpecificPlatformConfig = await createJobRequest(jobId, runId, job, latestDockerImage, configData);
+                const reportId = uuid.v4();
+                const test = await testsManager.getTest(job.test_id);
+                await createReportForJob(reportId, test, job);
+                const jobSpecificPlatformConfig = await createJobRequest(jobId, reportId, job, latestDockerImage, configData);
                 await jobConnector.runJob(jobSpecificPlatformConfig);
             }
         } catch (error) {
@@ -316,4 +318,11 @@ async function validateWebhooksAssignment(webhookIds) {
         const error = generateError(422, 'Assigning a global webhook to a job is not allowed');
         throw error;
     }
+}
+
+async function createReportForJob(reportId, test, job) {
+    const startTime = Date.now();
+    const report = await reportsManager.postReport(reportId, test, job, startTime);
+    logger.info({ test_id: test.id, report_id: reportId }, 'Created report successfully');
+    return report;
 }
